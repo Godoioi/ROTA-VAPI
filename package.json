@@ -1,8 +1,9 @@
 {
-  "name": "argus-webhook",
+  "name": "rota-vapi",
   "version": "1.0.0",
   "type": "module",
-  "devDependencies": {
-    "@types/node": "^24.5.2"
-  }
+  "scripts": {
+    "build": "echo \"no-build\""
+  },
+  "dependencies": {}
 }
