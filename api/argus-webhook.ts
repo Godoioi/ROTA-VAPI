@@ -16,45 +16,53 @@ function onlyDigits(v?: string) { return (v || "").replace(/\D/g, ""); }
 function looksLikePlaceholder(s?: string) {
   return typeof s === "string" && /{{\s*.+\s*}}/.test(s);
 }
-/** Converte vários formatos BR para E.164 (+55DDDN...) — EXIGE DDD. */
+/** Converte formatos BR para E.164 (+55DDDN...) — EXIGE DDD. */
 function toE164BR(v?: string): string | null {
   if (!v) return null;
   const compact = (v || "").replace(/[()\-\s]/g, "");
   if (/^\+55\d{10,11}$/.test(compact)) return compact;
   const d = onlyDigits(v);
   if (d.startsWith("0055") && (d.length === 14 || d.length === 15)) {
-    const rest = d.slice(4);
-    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+    const rest = d.slice(4); if (rest.length === 10 || rest.length === 11) return "+55" + rest;
   }
   if (d.startsWith("55") && (d.length === 12 || d.length === 13)) {
-    const rest = d.slice(2);
-    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+    const rest = d.slice(2); if (rest.length === 10 || rest.length === 11) return "+55" + rest;
   }
   if ((d.length === 11 || d.length === 12) && d.startsWith("0")) {
-    const s = d.replace(/^0+/, "");
-    if (s.length === 10 || s.length === 11) return "+55" + s;
+    const s = d.replace(/^0+/, ""); if (s.length === 10 || s.length === 11) return "+55" + s;
   }
   if (d.length === 10 || d.length === 11) return "+55" + d;
   return null;
 }
 
-/** Procura um telefone válido no payload inteiro (evita erro quando vier placeholder). */
+/** Separa segredo e telefone de um único header, p.ex.:
+ *  "170808|+5543..."  |  "secret=170808;ani=+5543..."  |  "170808 +5543..."  |  "170808,+5543..."
+ */
+function parseSecretAndPhoneFromHeader(h?: string): { secret?: string; phone?: string } {
+  if (!h) return {};
+  let v = h.replace(/^Bearer\s+/i, "").trim();
+  // transforma "secret=170808;ani=+55..." em tokens homogêneos
+  v = v.replace(/secret=/i, "").replace(/ani=|caller=|phone=/gi, "");
+  const tokens = v.split(/[,;| ]+/).filter(Boolean);
+  let secret: string | undefined;
+  let phone: string | undefined;
+  for (const t of tokens) {
+    const tok = t.trim();
+    if (!secret && /^\d{3,}$/.test(tok)) { secret = tok; continue; }
+    if (!phone  && /^\+?\d{8,15}$/.test(tok)) { phone = tok; continue; }
+  }
+  return { secret, phone };
+}
+
+/** Procura um telefone válido no payload/headers/query (ignora placeholders). */
 function extractPhoneBR(data: any): { raw?: string; e164?: string } {
   const candidates = [
-    data?.callee,
-    data?.phoneNumber,
-    data?.caller,
-    data?.call?.ani,
-    data?.call?.cli,
-    data?.call?.caller,
-    data?.customer?.phone,
-    data?.lead?.phone,
-    data?.lead?.telefone,
-    data?.lead?.celular,
-    data?.telefone,
-    data?.celular,
-    data?.phone,
-    data?.query_phone, // <- vindo pela query string (?ani= / ?phone= / ?caller=)
+    data?.header_phone,        // ← telefone vindo do header único
+    data?.callee, data?.phoneNumber, data?.caller,
+    data?.call?.ani, data?.call?.cli, data?.call?.caller,
+    data?.customer?.phone, data?.lead?.phone, data?.lead?.telefone, data?.lead?.celular,
+    data?.telefone, data?.celular, data?.phone,
+    data?.query_phone,         // ← querystring (se algum dia o Argus substituir)
   ].filter(Boolean);
 
   for (const c of candidates) {
@@ -64,7 +72,7 @@ function extractPhoneBR(data: any): { raw?: string; e164?: string } {
     if (e) return { raw: s, e164: e };
   }
 
-  // Varre qualquer string do JSON (às vezes o Argus envia em outro campo)
+  // varre strings soltas no JSON (último recurso)
   const strings: string[] = [];
   const walk = (o: any) => {
     if (!o) return;
@@ -73,7 +81,6 @@ function extractPhoneBR(data: any): { raw?: string; e164?: string } {
     else if (typeof o === "object") Object.values(o).forEach(walk);
   };
   walk(data);
-
   for (const s of strings) {
     if (looksLikePlaceholder(s)) continue;
     const e = toE164BR(s);
@@ -98,7 +105,6 @@ async function upsertArgusEvent({
     return;
   }
 
-  // upsert por external_id
   const r = await fetch(`${SUPABASE_URL}/rest/v1/argus_events?on_conflict=external_id`, {
     method: "POST",
     headers: { ...headers, Prefer: "resolution=merge-duplicates" },
@@ -121,7 +127,6 @@ function formatForSipProvider(e164: string) {
 }
 
 async function callVapiStart(data: any) {
-  // acha número (varre tudo, ignora placeholders)
   const { raw: rawTo, e164 } = extractPhoneBR(data);
   if (!e164) throw new Error(`Invalid phone: expected BR E.164 (+55DDDN...), got: ${rawTo ?? "[none]"}`);
 
@@ -157,21 +162,32 @@ export default async function handler(req: Request): Promise<Response> {
   try {
     if (req.method !== "POST") return new Response("Only POST", { status: 405 });
 
-    // Auth (aceita X-Argus-Secret ou ARGUS_WEBHOOK_SECRET; ignora prefixo Bearer)
-    const raw = req.headers.get("X-Argus-Secret") ?? req.headers.get("ARGUS_WEBHOOK_SECRET");
-    const provided = raw?.replace(/^Bearer\s+/i, "").trim();
-    if (ARGUS_WEBHOOK_SECRET && provided !== ARGUS_WEBHOOK_SECRET) {
+    // --- Auth + extração de telefone do ÚNICO header ---
+    const secretHeader = req.headers.get("X-Argus-Secret") ?? req.headers.get("Authorization");
+    const { secret: headerSecret, phone: headerPhone } = parseSecretAndPhoneFromHeader(secretHeader || "");
+    if (ARGUS_WEBHOOK_SECRET && headerSecret !== ARGUS_WEBHOOK_SECRET) {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    // Body + números também pela querystring (?ani= / ?phone= / ?caller=)
-    const payload = await req.json().catch(() => ({}));
+    // Body (json ou texto)
+    const contentType = req.headers.get("content-type") || "";
+    let payload: any = {};
+    if (contentType.includes("application/json")) {
+      payload = await req.json().catch(() => ({}));
+    } else {
+      const text = await req.text();
+      try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
+    }
+
+    // Query (?ani= / ?phone= / ?caller=) — se um dia o Argus substituir
     const url = new URL(req.url);
     const qPhone =
       url.searchParams.get("ani") ||
       url.searchParams.get("phone") ||
       url.searchParams.get("caller");
-    if (qPhone) (payload as any).query_phone = qPhone;
+
+    if (qPhone) payload.query_phone = qPhone;
+    if (headerPhone) payload.header_phone = headerPhone; // telefone vindo do header único
 
     externalId = payload?.id || externalId;
 
@@ -204,18 +220,18 @@ export default async function handler(req: Request): Promise<Response> {
     const msg = err?.message || String(err);
     console.error("argus-webhook error:", msg);
 
-    // Se não veio telefone válido, não derruba o Argus: marca no DB e retorna 200.
+    // Sem telefone válido: registra e NÃO quebra o Argus
     if (String(msg).startsWith("Invalid phone")) {
       try {
         await upsertArgusEvent({
           externalId,
           patch: { status: "invalid_phone", error: msg, processed_at: new Date().toISOString() },
         });
-      } catch { /* ignora erro de log */ }
+      } catch {}
       return new Response("ok (no-phone)", { status: 200 });
     }
 
-    // Demais erros: durante testes devolvemos 500; em produção você pode usar 202.
+    // Outros erros: 500 durante debug (em produção pode usar 202)
     return new Response(`error: ${msg}`, { status: 500 });
   }
 }
