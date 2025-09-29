@@ -13,9 +13,7 @@ const DRY_RUN = process.env.DRY_RUN === "1";                          // apenas 
 
 // ===== Utils =====
 function onlyDigits(v?: string) { return (v || "").replace(/\D/g, ""); }
-function looksLikePlaceholder(s?: string) {
-  return typeof s === "string" && /{{\s*.+\s*}}/.test(s);
-}
+function looksLikePlaceholder(s?: string) { return typeof s === "string" && /{{\s*.+\s*}}/.test(s); }
 /** Converte formatos BR para E.164 (+55DDDN...) — EXIGE DDD. */
 function toE164BR(v?: string): string | null {
   if (!v) return null;
@@ -35,13 +33,10 @@ function toE164BR(v?: string): string | null {
   return null;
 }
 
-/** Separa segredo e telefone de um único header, p.ex.:
- *  "170808|+5543..."  |  "secret=170808;ani=+5543..."  |  "170808 +5543..."  |  "170808,+5543..."
- */
+/** "170808|+55..." | "secret=170808;ani=+55..." | "170808 +55..." */
 function parseSecretAndPhoneFromHeader(h?: string): { secret?: string; phone?: string } {
   if (!h) return {};
   let v = h.replace(/^Bearer\s+/i, "").trim();
-  // transforma "secret=170808;ani=+55..." em tokens homogêneos
   v = v.replace(/secret=/i, "").replace(/ani=|caller=|phone=/gi, "");
   const tokens = v.split(/[,;| ]+/).filter(Boolean);
   let secret: string | undefined;
@@ -54,15 +49,16 @@ function parseSecretAndPhoneFromHeader(h?: string): { secret?: string; phone?: s
   return { secret, phone };
 }
 
-/** Procura um telefone válido no payload/headers/query (ignora placeholders). */
+/** Procura telefone válido em headers/query/path/body (ignora placeholders). */
 function extractPhoneBR(data: any): { raw?: string; e164?: string } {
   const candidates = [
-    data?.header_phone,        // ← telefone vindo do header único
+    data?.header_phone,             // ← header único
+    data?.path_phone,               // ← path param
+    data?.query_phone,              // ← querystring
     data?.callee, data?.phoneNumber, data?.caller,
     data?.call?.ani, data?.call?.cli, data?.call?.caller,
     data?.customer?.phone, data?.lead?.phone, data?.lead?.telefone, data?.lead?.celular,
     data?.telefone, data?.celular, data?.phone,
-    data?.query_phone,         // ← querystring (se algum dia o Argus substituir)
   ].filter(Boolean);
 
   for (const c of candidates) {
@@ -72,7 +68,7 @@ function extractPhoneBR(data: any): { raw?: string; e164?: string } {
     if (e) return { raw: s, e164: e };
   }
 
-  // varre strings soltas no JSON (último recurso)
+  // último recurso: varre strings do JSON
   const strings: string[] = [];
   const walk = (o: any) => {
     if (!o) return;
@@ -179,15 +175,21 @@ export default async function handler(req: Request): Promise<Response> {
       try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
     }
 
-    // Query (?ani= / ?phone= / ?caller=) — se um dia o Argus substituir
+    // Query (?ani= / ?phone= / ?caller=)
     const url = new URL(req.url);
     const qPhone =
       url.searchParams.get("ani") ||
       url.searchParams.get("phone") ||
       url.searchParams.get("caller");
-
     if (qPhone) payload.query_phone = qPhone;
-    if (headerPhone) payload.header_phone = headerPhone; // telefone vindo do header único
+
+    // Path param: .../api/argus-webhook/+55DDDN...
+    const parts = url.pathname.split("/").filter(Boolean);
+    const last = decodeURIComponent(parts[parts.length - 1] || "");
+    if (/^\+?\d[\d()\-.\s]+$/.test(last)) payload.path_phone = last;
+
+    // Header único com segredo + número
+    if (headerPhone) payload.header_phone = headerPhone;
 
     externalId = payload?.id || externalId;
 
