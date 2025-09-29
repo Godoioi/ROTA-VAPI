@@ -72,7 +72,9 @@ async function upsertArgusEvent({
     return;
   }
 
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/argus_events`, {
+const r = await fetch(
+  `${SUPABASE_URL}/rest/v1/argus_events?on_conflict=external_id`,
+  {
     method: "POST",
     headers: { ...headers, Prefer: "resolution=merge-duplicates" },
     body: JSON.stringify([
@@ -83,7 +85,8 @@ async function upsertArgusEvent({
         status: "received",
       },
     ]),
-  });
+  }
+);
   if (!r.ok) throw new Error(`DB insert ${r.status}: ${await r.text()}`);
 }
 
@@ -126,6 +129,7 @@ export default async function handler(req: Request): Promise<Response> {
   return new Response(`error: ${msg}`, { status: 500 });
 }
 }
+
 
 
 
