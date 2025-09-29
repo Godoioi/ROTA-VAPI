@@ -1,7 +1,5 @@
 // api/argus-webhook.ts
-export const config = {
-  runtime: "edge"
-};
+export const config = { runtime: "edge" };
 
 
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
@@ -126,4 +124,5 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("accepted", { status: 202 });
   }
 }
+
 
