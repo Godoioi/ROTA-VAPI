@@ -1,4 +1,8 @@
-export const runtime = "edge";
+// api/argus-webhook.ts
+export const config = {
+  runtime: "edge",
+  regions: ["gru1", "iad1"], // opcional, GRU é bom p/ BR
+};
 
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
@@ -49,10 +53,7 @@ async function upsertArgusEvent({
 
   const r = await fetch(`${SUPABASE_URL}/rest/v1/argus_events`, {
     method: "POST",
-    headers: {
-      ...headers,
-      Prefer: "resolution=merge-duplicates",
-    },
+    headers: { ...headers, Prefer: "resolution=merge-duplicates" },
     body: JSON.stringify([
       {
         external_id: externalId,
@@ -65,14 +66,13 @@ async function upsertArgusEvent({
   if (!r.ok) throw new Error(`DB insert ${r.status}: ${await r.text()}`);
 }
 
-export async function POST(req: Request) {
+// Web padrão (Edge): handler default recebe Request e retorna Response
+export default async function handler(req: Request): Promise<Response> {
   try {
     if (req.method !== "POST") return new Response("Only POST", { status: 405 });
 
     const payload = await req.json().catch(() => ({}));
-    const externalId = payload?.id ?? crypto.randomUUID();
-
-    // opcional: verificar assinatura HMAC
+    const externalId = (payload && payload.id) || crypto.randomUUID();
 
     await upsertArgusEvent({ externalId, eventType: payload?.type, payload });
 
@@ -90,6 +90,7 @@ export async function POST(req: Request) {
     return new Response("ok", { status: 200 });
   } catch (err: any) {
     console.error("argus-webhook error:", err?.message || err);
+    // 202 permite retry no lado do Argus
     return new Response("accepted", { status: 202 });
   }
 }
