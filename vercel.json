@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/argus-webhook.ts": {
-      "runtime": "edge"
-    }
-  }
-}
