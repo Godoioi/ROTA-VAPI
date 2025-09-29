@@ -118,11 +118,14 @@ export default async function handler(req: Request): Promise<Response> {
     });
 
     return new Response("ok", { status: 200 });
-  } catch (err: any) {
-    // marque erro para reprocessar depois, se quiser
-    console.error("argus-webhook error:", err?.message || err);
-    return new Response("accepted", { status: 202 });
-  }
+} catch (err: any) {
+  const msg = err?.message || String(err);
+  // deixa registrado nos logs também
+  console.error("argus-webhook error:", msg);
+  // durante o debug, devolva o erro pro cliente
+  return new Response(`error: ${msg}`, { status: 500 });
 }
+}
+
 
 
