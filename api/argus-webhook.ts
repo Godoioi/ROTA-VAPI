@@ -1,8 +1,8 @@
 // api/argus-webhook.ts
 export const config = {
-  runtime: "edge",
-  regions: ["gru1", "iad1"], // GRU p/ BR, IAD fallback
+  runtime: "edge"
 };
+
 
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
@@ -126,3 +126,4 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("accepted", { status: 202 });
   }
 }
+
