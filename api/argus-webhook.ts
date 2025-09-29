@@ -9,7 +9,7 @@ const VAPI_API_KEY = process.env.VAPI_API_KEY!;
 const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || "";        // obrigatório
 const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID || "";  // ORIGEM (um dos dois)
 const VAPI_SIP_TRUNK_ID   = process.env.VAPI_SIP_TRUNK_ID   || "";    // ORIGEM (alternativa)
-const DRY_RUN = process.env.DRY_RUN === "1";                           // apenas grava banco
+const DRY_RUN = process.env.DRY_RUN === "1";                          // apenas grava banco
 
 // ===== Utils =====
 function onlyDigits(v?: string) { return (v || "").replace(/\D/g, ""); }
@@ -23,13 +23,16 @@ function toE164BR(v?: string): string | null {
   if (/^\+55\d{10,11}$/.test(compact)) return compact;
   const d = onlyDigits(v);
   if (d.startsWith("0055") && (d.length === 14 || d.length === 15)) {
-    const rest = d.slice(4); if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+    const rest = d.slice(4);
+    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
   }
   if (d.startsWith("55") && (d.length === 12 || d.length === 13)) {
-    const rest = d.slice(2); if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+    const rest = d.slice(2);
+    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
   }
   if ((d.length === 11 || d.length === 12) && d.startsWith("0")) {
-    const s = d.replace(/^0+/, ""); if (s.length === 10 || s.length === 11) return "+55" + s;
+    const s = d.replace(/^0+/, "");
+    if (s.length === 10 || s.length === 11) return "+55" + s;
   }
   if (d.length === 10 || d.length === 11) return "+55" + d;
   return null;
@@ -38,10 +41,20 @@ function toE164BR(v?: string): string | null {
 /** Procura um telefone válido no payload inteiro (evita erro quando vier placeholder). */
 function extractPhoneBR(data: any): { raw?: string; e164?: string } {
   const candidates = [
-    data?.callee, data?.phoneNumber, data?.caller,
-    data?.call?.ani, data?.call?.cli, data?.call?.caller,
-    data?.customer?.phone, data?.lead?.phone, data?.lead?.telefone, data?.lead?.celular,
-    data?.telefone, data?.celular, data?.phone,
+    data?.callee,
+    data?.phoneNumber,
+    data?.caller,
+    data?.call?.ani,
+    data?.call?.cli,
+    data?.call?.caller,
+    data?.customer?.phone,
+    data?.lead?.phone,
+    data?.lead?.telefone,
+    data?.lead?.celular,
+    data?.telefone,
+    data?.celular,
+    data?.phone,
+    data?.query_phone, // <- vindo pela query string (?ani= / ?phone= / ?caller=)
   ].filter(Boolean);
 
   for (const c of candidates) {
@@ -85,10 +98,16 @@ async function upsertArgusEvent({
     return;
   }
 
+  // upsert por external_id
   const r = await fetch(`${SUPABASE_URL}/rest/v1/argus_events?on_conflict=external_id`, {
     method: "POST",
     headers: { ...headers, Prefer: "resolution=merge-duplicates" },
-    body: JSON.stringify([{ external_id: externalId, event_type: eventType ?? "unknown", payload: payload ?? {}, status: "received" }]),
+    body: JSON.stringify([{
+      external_id: externalId,
+      event_type: eventType ?? "unknown",
+      payload: payload ?? {},
+      status: "received",
+    }]),
   });
   if (!r.ok) throw new Error(`DB insert ${r.status}: ${await r.text()}`);
 }
@@ -145,14 +164,25 @@ export default async function handler(req: Request): Promise<Response> {
       return new Response("Unauthorized", { status: 401 });
     }
 
+    // Body + números também pela querystring (?ani= / ?phone= / ?caller=)
     const payload = await req.json().catch(() => ({}));
+    const url = new URL(req.url);
+    const qPhone =
+      url.searchParams.get("ani") ||
+      url.searchParams.get("phone") ||
+      url.searchParams.get("caller");
+    if (qPhone) (payload as any).query_phone = qPhone;
+
     externalId = payload?.id || externalId;
 
-    // grava evento
+    // grava evento inicial
     await upsertArgusEvent({ externalId, eventType: payload?.type, payload });
 
     if (DRY_RUN) {
-      await upsertArgusEvent({ externalId, patch: { status: "queued", processed_at: new Date().toISOString() } });
+      await upsertArgusEvent({
+        externalId,
+        patch: { status: "queued", processed_at: new Date().toISOString() },
+      });
       return new Response("ok (dry-run)", { status: 200 });
     }
 
@@ -181,11 +211,11 @@ export default async function handler(req: Request): Promise<Response> {
           externalId,
           patch: { status: "invalid_phone", error: msg, processed_at: new Date().toISOString() },
         });
-      } catch { /* não bloqueia a resposta */ }
+      } catch { /* ignora erro de log */ }
       return new Response("ok (no-phone)", { status: 200 });
     }
 
-    // Demais erros: pode devolver 202 pra Argus re-tentar, ou 500 durante debug.
+    // Demais erros: durante testes devolvemos 500; em produção você pode usar 202.
     return new Response(`error: ${msg}`, { status: 500 });
   }
 }
