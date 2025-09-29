@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "app/api/argus-webhook/route.ts": {
+      "runtime": "edge",
+      "regions": ["gru1", "iad1"]
+    }
+  }
+}
