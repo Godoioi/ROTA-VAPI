@@ -1,28 +1,47 @@
 // api/argus-webhook.ts
 export const config = {
   runtime: "edge",
-  regions: ["gru1", "iad1"], // opcional, GRU é bom p/ BR
+  regions: ["gru1", "iad1"], // GRU p/ BR, IAD fallback
 };
 
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const ARGUS_WEBHOOK_SECRET = process.env.ARGUS_WEBHOOK_SECRET || "";
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || "";
+
+function normalizePhone(v?: string) {
+  if (!v || typeof v !== "string") return v;
+  return v.replace(/[()\-\s]/g, "");
+}
 
 async function callVapiStart(data: any) {
+  const to = normalizePhone(data?.callee ?? data?.phoneNumber);
+  const from = normalizePhone(data?.caller);
+  if (!to) throw new Error("Missing callee/phoneNumber in payload");
+
+  const body: Record<string, any> = {
+    to,
+    from,
+    metadata: { source: "argus", argusId: data?.id },
+  };
+  const assistantId = data?.assistantId || VAPI_ASSISTANT_ID;
+  if (assistantId) body.assistantId = assistantId;
+
   const res = await fetch("https://api.vapi.ai/calls", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${VAPI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      to: data?.callee ?? data?.phoneNumber,
-      from: data?.caller ?? undefined,
-      metadata: { source: "argus", argusId: data?.id },
-    }),
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Vapi ${res.status}: ${await res.text()}`);
-  return res.json();
+
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Vapi ${res.status}: ${t}`);
+  }
+  return res.json(); // { id: "...", ... }
 }
 
 async function upsertArgusEvent({
@@ -46,7 +65,11 @@ async function upsertArgusEvent({
     const url = `${SUPABASE_URL}/rest/v1/argus_events?external_id=eq.${encodeURIComponent(
       externalId
     )}`;
-    const r = await fetch(url, { method: "PATCH", headers, body: JSON.stringify(patch) });
+    const r = await fetch(url, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify(patch),
+    });
     if (!r.ok) throw new Error(`DB patch ${r.status}: ${await r.text()}`);
     return;
   }
@@ -66,16 +89,25 @@ async function upsertArgusEvent({
   if (!r.ok) throw new Error(`DB insert ${r.status}: ${await r.text()}`);
 }
 
-// Web padrão (Edge): handler default recebe Request e retorna Response
 export default async function handler(req: Request): Promise<Response> {
   try {
     if (req.method !== "POST") return new Response("Only POST", { status: 405 });
 
+    // 1) Autorização simples por header
+    if (ARGUS_WEBHOOK_SECRET) {
+      const hdr = req.headers.get("X-Argus-Secret");
+      if (hdr !== ARGUS_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+    }
+
+    // 2) Payload + idempotência
     const payload = await req.json().catch(() => ({}));
-    const externalId = (payload && payload.id) || crypto.randomUUID();
+    const externalId: string = payload?.id || crypto.randomUUID();
 
     await upsertArgusEvent({ externalId, eventType: payload?.type, payload });
 
+    // 3) Chama Vapi já no caminho síncrono (modo A - relay)
     const vapi = await callVapiStart(payload);
 
     await upsertArgusEvent({
@@ -89,8 +121,8 @@ export default async function handler(req: Request): Promise<Response> {
 
     return new Response("ok", { status: 200 });
   } catch (err: any) {
+    // marque erro para reprocessar depois, se quiser
     console.error("argus-webhook error:", err?.message || err);
-    // 202 permite retry no lado do Argus
     return new Response("accepted", { status: 202 });
   }
 }
