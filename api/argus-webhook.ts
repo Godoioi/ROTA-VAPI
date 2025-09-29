@@ -1,27 +1,54 @@
 // api/argus-webhook.ts
 export const config = { runtime: "edge" };
 
-// ====== ENV ======
+// ===== ENV =====
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ARGUS_WEBHOOK_SECRET = process.env.ARGUS_WEBHOOK_SECRET || "";
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || "";      // opcional (recomendado)
-const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID || ""; // opcional (origem)
-const VAPI_SIP_TRUNK_ID = process.env.VAPI_SIP_TRUNK_ID || "";       // opcional (origem via SIP)
-const DRY_RUN = process.env.DRY_RUN === "1";                          // opcional
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || "";        // obrigatório para a Vapi (se não vier no payload)
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID || "";  // origem (um dos dois é obrigatório)
+const VAPI_SIP_TRUNK_ID = process.env.VAPI_SIP_TRUNK_ID || "";        // origem (alternativa)
+const DRY_RUN = process.env.DRY_RUN === "1";                           // para testar só o DB
 
-function requireEnv(name: string, optional = false) {
-  const v = (process.env as any)[name];
-  if (!v && !optional) throw new Error(`Missing env: ${name}`);
-  return v as string;
+// ===== Utils =====
+function onlyDigits(v?: string) {
+  return (v || "").replace(/\D/g, "");
 }
 
-// ====== Utils ======
-function normalizePhone(v?: string) {
-  if (!v || typeof v !== "string") return v;
-  // remove espaços/parênteses/hífens; mantém o '+' se existir
-  return v.replace(/[()\-\s]/g, "");
+/** Converte vários formatos BR para E.164 (+55DDDN...) — EXIGE DDD. */
+function toE164BR(v?: string): string | null {
+  if (!v) return null;
+
+  const compact = (v || "").replace(/[()\-\s]/g, "");
+  // já está em +55 e 10/11 dígitos?
+  if (/^\+55\d{10,11}$/.test(compact)) return compact;
+
+  const d = onlyDigits(v);
+
+  // 0055DDDN... → +55DDDN...
+  if (d.startsWith("0055") && (d.length === 14 || d.length === 15)) {
+    const rest = d.slice(4);
+    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+  }
+
+  // 55DDDN... (sem +)
+  if (d.startsWith("55") && (d.length === 12 || d.length === 13)) {
+    const rest = d.slice(2);
+    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+  }
+
+  // 0DDDN... → remove "0" de tronco
+  if ((d.length === 11 || d.length === 12) && d.startsWith("0")) {
+    const s = d.replace(/^0+/, "");
+    if (s.length === 10 || s.length === 11) return "+55" + s;
+  }
+
+  // Nacional com DDD (10 = fixo, 11 = móvel)
+  if (d.length === 10 || d.length === 11) return "+55" + d;
+
+  // Se veio sem DDD (8/9 dígitos), não inferimos para não discar errado.
+  return null;
 }
 
 async function upsertArgusEvent({
@@ -45,16 +72,12 @@ async function upsertArgusEvent({
     const url = `${SUPABASE_URL}/rest/v1/argus_events?external_id=eq.${encodeURIComponent(
       externalId
     )}`;
-    const r = await fetch(url, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify(patch),
-    });
+    const r = await fetch(url, { method: "PATCH", headers, body: JSON.stringify(patch) });
     if (!r.ok) throw new Error(`DB patch ${r.status}: ${await r.text()}`);
     return;
   }
 
-  // upsert de verdade (merge-duplicates) com base no índice único external_id
+  // Upsert por external_id
   const r = await fetch(
     `${SUPABASE_URL}/rest/v1/argus_events?on_conflict=external_id`,
     {
@@ -74,13 +97,16 @@ async function upsertArgusEvent({
 }
 
 async function callVapiStart(data: any) {
-  const to = normalizePhone(data?.callee ?? data?.phoneNumber);
-  if (!to) throw new Error("Missing destination: callee/phoneNumber");
+  // destino
+  const rawTo = data?.callee ?? data?.phoneNumber;
+  const to = toE164BR(rawTo);
+  if (!to) throw new Error(`Invalid phone: expected BR E.164 (+55DDDN...), got: ${rawTo}`);
 
+  // assistant
   const assistantId = data?.assistantId || VAPI_ASSISTANT_ID;
   if (!assistantId) throw new Error("Vapi: assistantId is required");
 
-  // origem: preferir phoneNumberId; se não houver, tentar sipTrunkId
+  // origem (um dos dois)
   const phoneNumberId = data?.phoneNumberId || VAPI_PHONE_NUMBER_ID;
   const sipTrunkId = data?.sipTrunkId || VAPI_SIP_TRUNK_ID;
   if (!phoneNumberId && !sipTrunkId) {
@@ -89,7 +115,7 @@ async function callVapiStart(data: any) {
 
   const body: Record<string, any> = {
     assistantId,
-    customer: { number: to }, // E.164: +55...
+    customer: { number: to },
     metadata: { source: "argus", argusId: data?.id ?? null },
   };
   if (phoneNumberId) body.phoneNumberId = phoneNumberId;
@@ -98,58 +124,46 @@ async function callVapiStart(data: any) {
   const res = await fetch("https://api.vapi.ai/call", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${requireEnv("VAPI_API_KEY")}`,
+      Authorization: `Bearer ${VAPI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
   });
 
   if (!res.ok) throw new Error(`Vapi ${res.status}: ${await res.text()}`);
-  return res.json(); // geralmente { id: "...", ... }
+  return res.json(); // { id: "...", ... }
 }
 
-// ====== Handler ======
+// ===== Handler =====
 export default async function handler(req: Request): Promise<Response> {
   try {
-    if (req.method !== "POST") {
-      return new Response("Only POST", { status: 405 });
+    if (req.method !== "POST") return new Response("Only POST", { status: 405 });
+
+    // autenticação por header (aceita os dois nomes)
+    const hdr =
+      req.headers.get("X-Argus-Secret") ?? req.headers.get("ARGUS_WEBHOOK_SECRET");
+    if (ARGUS_WEBHOOK_SECRET && hdr !== ARGUS_WEBHOOK_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
     }
 
-    // 1) valida o segredo do Argus (se configurado)
-    if (ARGUS_WEBHOOK_SECRET) {
-      const hdr = req.headers.get("X-Argus-Secret");
-      if (hdr !== ARGUS_WEBHOOK_SECRET) {
-        return new Response("Unauthorized", { status: 401 });
-      }
-    }
-
-    // 2) payload e idempotência
     const payload = await req.json().catch(() => ({}));
     const externalId: string = payload?.id || crypto.randomUUID();
 
-    // 3) registra/atualiza no Supabase
-    await upsertArgusEvent({
-      externalId,
-      eventType: payload?.type,
-      payload,
-    });
+    // registra evento (idempotente)
+    await upsertArgusEvent({ externalId, eventType: payload?.type, payload });
 
-    // 4) Modo DRY_RUN: não chama a Vapi; marca como 'queued'
     if (DRY_RUN) {
       await upsertArgusEvent({
         externalId,
-        patch: {
-          status: "queued",
-          processed_at: new Date().toISOString(),
-        },
+        patch: { status: "queued", processed_at: new Date().toISOString() },
       });
       return new Response("ok (dry-run)", { status: 200 });
     }
 
-    // 5) chama a Vapi agora (modo relay)
+    // chama Vapi
     const vapi = await callVapiStart(payload);
 
-    // 6) atualiza status e id da Vapi
+    // atualiza status
     await upsertArgusEvent({
       externalId,
       patch: {
@@ -163,8 +177,7 @@ export default async function handler(req: Request): Promise<Response> {
   } catch (err: any) {
     const msg = err?.message || String(err);
     console.error("argus-webhook error:", msg);
-    // Durante a depuração devolvemos 500 com a mensagem.
-    // (Depois, se preferir, troque para: return new Response("accepted", { status: 202 });)
+    // durante os testes devolvemos 500 com detalhe; depois pode mudar para 202 se quiser.
     return new Response(`error: ${msg}`, { status: 500 });
   }
 }
