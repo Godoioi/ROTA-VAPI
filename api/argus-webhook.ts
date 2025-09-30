@@ -6,8 +6,7 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ARGUS_WEBHOOK_SECRET = (process.env.ARGUS_WEBHOOK_SECRET || "").trim();
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // opcional (pode vir no payload)
-const DRY_RUN = process.env.DRY_RUN === "1";                   // "1" para não chamar a Vapi
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // opcional
 
 // ===== Utils =====
 const onlyDigits = (v?: string) => (v || "").replace(/\D/g, "");
@@ -36,7 +35,7 @@ function toE164BR(v?: string): string | null {
   return null;
 }
 
-/** Lê segredo/telefone quando vierem misturados no header. Ex.: "170808|+5543999..." */
+/** Aceita "170808|+55...", "secret=170808;ani=+55...", "Bearer 170808 +55..." */
 function parseSecretAndPhoneFromHeader(h?: string): { secret?: string; phone?: string } {
   if (!h) return {};
   let v = h.replace(/^Bearer\s+/i, "").trim();
@@ -57,7 +56,7 @@ function pick<T>(...vals: (T | undefined | null | "")[]): T | undefined {
   return undefined;
 }
 
-/** Gera ID estável (hash) quando as macros do Argus não expandem. */
+/** ID estável (hash) quando macros não expandem. */
 async function stableIdFromPayload(payload: any) {
   const enc = new TextEncoder().encode(JSON.stringify(payload ?? {}));
   const buf = await crypto.subtle.digest("SHA-256", enc);
@@ -68,7 +67,7 @@ async function stableIdFromPayload(payload: any) {
 /** Procura telefone válido em vários campos; ignora placeholders. */
 function extractPhoneBR(payload: any): { raw?: string; e164?: string } {
   const candidates = [
-    payload?.header_phone, payload?.path_phone, payload?.query_phone,
+    payload?.header_phone, payload?.query_phone, payload?.path_phone,
     payload?.callee, payload?.phoneNumber, payload?.caller, payload?.to,
     payload?.call?.ani, payload?.call?.cli, payload?.call?.caller,
     payload?.customer?.phone, payload?.lead?.phone, payload?.lead?.telefone, payload?.lead?.celular,
@@ -77,21 +76,6 @@ function extractPhoneBR(payload: any): { raw?: string; e164?: string } {
 
   for (const c of candidates) {
     const s = String(c);
-    if (looksLikeTpl(s)) continue;
-    const e = toE164BR(s);
-    if (e) return { raw: s, e164: e };
-  }
-
-  // Último recurso: varre strings do JSON
-  const strings: string[] = [];
-  const walk = (o: any) => {
-    if (!o) return;
-    if (typeof o === "string") strings.push(o);
-    else if (Array.isArray(o)) o.forEach(walk);
-    else if (typeof o === "object") Object.values(o).forEach(walk);
-  };
-  walk(payload);
-  for (const s of strings) {
     if (looksLikeTpl(s)) continue;
     const e = toE164BR(s);
     if (e) return { raw: s, e164: e };
@@ -129,7 +113,7 @@ async function upsertArgusEvent(opts: {
   if (!r.ok) throw new Error(`DB insert ${r.status}: ${await r.text()}`);
 }
 
-/** Chama a Vapi (endpoint /calls) com to/from em E.164; assistantId opcional. */
+/** Chama a Vapi (endpoint /calls) com to/from; assistantId opcional. */
 async function callVapiStart(payload: any) {
   const { e164: to } = extractPhoneBR(payload);
   if (!to) throw new Error("invalid_phone: payload não contém número BR válido (+55DDDN...).");
@@ -157,38 +141,34 @@ export default async function handler(req: Request): Promise<Response> {
   // Apenas POST
   if (req.method !== "POST") return new Response("Only POST", { status: 405 });
 
-  // Header: X-Argus-Secret (com ou sem ANI misturado)
+  // --- Auth + telefone no mesmo header (se vier) ---
   const secHeader = req.headers.get("X-Argus-Secret") ?? req.headers.get("Authorization") ?? "";
   const { secret: headerSecret, phone: headerPhone } = parseSecretAndPhoneFromHeader(secHeader);
   if (ARGUS_WEBHOOK_SECRET && headerSecret !== ARGUS_WEBHOOK_SECRET) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  // Body (json ou texto)
-  const contentType = req.headers.get("content-type") || "";
+  // --- Body (json ou texto) ---
+  const ct = req.headers.get("content-type") || "";
   let payload: any = {};
-  if (contentType.includes("application/json")) {
+  if (ct.includes("application/json")) {
     payload = await req.json().catch(() => ({}));
   } else {
-    const rawText = await req.text();
-    try { payload = JSON.parse(rawText); } catch { payload = { raw: rawText }; }
+    const txt = await req.text();
+    try { payload = JSON.parse(txt); } catch { payload = { raw: txt }; }
   }
 
-  // (1) Duplo parse: Argus às vezes manda JSON como string
+  // (1) Duplo parse: se veio como string JSON, parse de novo
   if (typeof payload === "string") {
     try { payload = JSON.parse(payload); } catch { /* segue sem quebrar */ }
   }
 
-  // (2) Header com ANI explícito (melhor lugar pra garantir o número)
-  if (headerPhone) {
-    (payload ??= {}).header_phone = headerPhone;
-  }
+  // (2) Header dedicado com ANI (e também aceita o phone do X-Argus-Secret)
   const xAni = req.headers.get("X-Argus-ANI");
-  if (xAni) {
-    (payload ??= {}).header_phone = xAni;
-  }
+  if (xAni) (payload ??= {}).header_phone = xAni;
+  else if (headerPhone) (payload ??= {}).header_phone = headerPhone;
 
-  // (3) Query e path (usam nomes diferentes no seu código para não conflitar com nada)
+  // Query & Path (opcional – ajuda em testes)
   const reqUrl = new URL(req.url);
   const queryAni = reqUrl.searchParams.get("ani")
                  || reqUrl.searchParams.get("phone")
@@ -199,29 +179,20 @@ export default async function handler(req: Request): Promise<Response> {
   const pathTail = decodeURIComponent(pathParts[pathParts.length - 1] || "");
   if (/^\+?\d[\d()\-.\s]+$/.test(pathTail)) payload.path_phone = pathTail;
 
-  // externalId: tenta vários; se vier placeholder ou vazio, gera ID estável
+  // externalId: usa payload.id/call.id; se vier placeholder, gera estável
   let externalId = pick<string>(payload?.id, payload?.callId, payload?.call?.id) || "";
   if (!externalId || looksLikeTpl(externalId)) {
     externalId = await stableIdFromPayload(payload);
   }
 
-  // grava recebido
+  // grava "received"
   try {
     await upsertArgusEvent({ externalId, eventType: payload?.type, payload });
   } catch {
     return new Response("db_error", { status: 202 });
   }
 
-  // Dry-run (para testar sem ligar para a Vapi)
-  if (DRY_RUN) {
-    await upsertArgusEvent({
-      externalId,
-      patch: { status: "queued", processed_at: new Date().toISOString(), error: null },
-    });
-    return new Response("ok (dry-run)", { status: 200 });
-  }
-
-  // chama Vapi
+  // chama Vapi (relay)
   try {
     const vapi = await callVapiStart(payload);
     await upsertArgusEvent({
@@ -244,7 +215,6 @@ export default async function handler(req: Request): Promise<Response> {
         processed_at: new Date().toISOString()
       },
     });
-    // 200 para não forçar retry agressivo do Argus
     return new Response("ok (error logged)", { status: 200 });
   }
 }
