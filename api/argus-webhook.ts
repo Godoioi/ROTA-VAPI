@@ -56,12 +56,34 @@ function pick<T>(...vals: (T | undefined | null | "")[]): T | undefined {
   return undefined;
 }
 
-/** ID estável (hash) quando macros não expandem. */
+/** Gera ID estável (hash) quando macros não expandem. */
 async function stableIdFromPayload(payload: any) {
   const enc = new TextEncoder().encode(JSON.stringify(payload ?? {}));
   const buf = await crypto.subtle.digest("SHA-256", enc);
   const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
   return "evt_" + hex.slice(0, 24);
+}
+
+/** Máscara o segredo nos headers para salvar no debug. */
+function maskSecret(h: Headers) {
+  const obj: Record<string, string> = {};
+  for (const [k, v] of h.entries()) {
+    obj[k] = /x-argus-secret/i.test(k) ? v.replace(/\d/g, "•") : v;
+  }
+  return obj;
+}
+
+/** Procura telefones no texto cru: +55DDDN..., 55DDDN..., ou sequências de 10–13 dígitos. */
+function findPhonesInRaw(raw: string): string[] {
+  const out = new Set<string>();
+  if (!raw) return [];
+  for (const m of raw.matchAll(/\+55\d{10,11}/g)) out.add(m[0]);                    // +55...
+  for (const m of raw.matchAll(/(?<!\d)55\d{10,11}(?!\d)/g)) out.add("+" + m[0]);  // 55...
+  for (const m of raw.matchAll(/(?<!\d)\d{10,13}(?!\d)/g)) {                       // 10–13 dígitos
+    const e = toE164BR(m[0]);
+    if (e) out.add(e);
+  }
+  return Array.from(out);
 }
 
 /** Procura telefone válido em vários campos; ignora placeholders. */
@@ -141,12 +163,16 @@ export default async function handler(req: Request): Promise<Response> {
   // Apenas POST
   if (req.method !== "POST") return new Response("Only POST", { status: 405 });
 
-  // --- Auth + telefone no mesmo header (se vier) ---
+  // --- Auth + segredo/telefone no mesmo header (se vier) ---
   const secHeader = req.headers.get("X-Argus-Secret") ?? req.headers.get("Authorization") ?? "";
   const { secret: headerSecret, phone: headerPhone } = parseSecretAndPhoneFromHeader(secHeader);
   if (ARGUS_WEBHOOK_SECRET && headerSecret !== ARGUS_WEBHOOK_SECRET) {
     return new Response("Unauthorized", { status: 401 });
   }
+
+  // Leia o corpo cru (para debug) SEM consumir o original
+  const cloned = req.clone();
+  const rawText = await cloned.text().catch(() => "");
 
   // --- Body (json ou texto) ---
   const ct = req.headers.get("content-type") || "";
@@ -158,17 +184,17 @@ export default async function handler(req: Request): Promise<Response> {
     try { payload = JSON.parse(txt); } catch { payload = { raw: txt }; }
   }
 
-  // (1) Duplo parse: se veio como string JSON, parse de novo
+  // Duplo parse: se veio como string JSON, parse de novo
   if (typeof payload === "string") {
     try { payload = JSON.parse(payload); } catch { /* segue sem quebrar */ }
   }
 
-  // (2) Header dedicado com ANI (e também aceita o phone do X-Argus-Secret)
+  // Header dedicado com ANI OU telefone embutido em X-Argus-Secret
   const xAni = req.headers.get("X-Argus-ANI");
   if (xAni) (payload ??= {}).header_phone = xAni;
   else if (headerPhone) (payload ??= {}).header_phone = headerPhone;
 
-  // Query & Path (opcional – ajuda em testes)
+  // Query & Path (para cobrir variações)
   const reqUrl = new URL(req.url);
   const queryAni = reqUrl.searchParams.get("ani")
                  || reqUrl.searchParams.get("phone")
@@ -179,7 +205,23 @@ export default async function handler(req: Request): Promise<Response> {
   const pathTail = decodeURIComponent(pathParts[pathParts.length - 1] || "");
   if (/^\+?\d[\d()\-.\s]+$/.test(pathTail)) payload.path_phone = pathTail;
 
-  // externalId: usa payload.id/call.id; se vier placeholder, gera estável
+  // DEBUG: salva cabeçalhos (mascarados), url e body cru
+  (payload.debug ??= {}).headers = maskSecret(req.headers);
+  payload.debug.url = req.url;
+  payload.debug.raw = rawText;
+
+  // Fallback: se ainda não tiver número em header/query/path, tenta achar no raw
+  if (!payload.header_phone && !payload.query_phone && !payload.path_phone) {
+    const found = findPhonesInRaw(rawText);
+    if (found.length === 1) {
+      payload.header_phone = found[0];
+    } else if (found.length > 1) {
+      payload.header_phone = found[0]; // pega o primeiro
+      (payload.debug ??= {}).raw_candidates = found;
+    }
+  }
+
+  // externalId: usa payload.id/call.id; se vier placeholder ou vazio, gera estável
   let externalId = pick<string>(payload?.id, payload?.callId, payload?.call?.id) || "";
   if (!externalId || looksLikeTpl(externalId)) {
     externalId = await stableIdFromPayload(payload);
@@ -215,6 +257,7 @@ export default async function handler(req: Request): Promise<Response> {
         processed_at: new Date().toISOString()
       },
     });
+    // 200 para não forçar retry agressivo do Argus
     return new Response("ok (error logged)", { status: 200 });
   }
 }
