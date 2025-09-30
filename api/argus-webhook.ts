@@ -169,6 +169,26 @@ export default async function handler(req: Request): Promise<Response> {
     const text = await req.text();
     try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
   }
+    // (1) Duplo parse: Argus às vezes manda JSON como string
+  if (typeof payload === "string") {
+    try { payload = JSON.parse(payload); } catch { /* segue sem quebrar */ }
+  }
+  
+  // (2) Header com ANI explícito (melhor lugar pra garantir o número)
+  const xAni = req.headers.get("X-Argus-ANI");
+  if (xAni) {
+    (payload ??= {}).header_phone = xAni;
+  }
+  
+  // (opcional, mas útil) Também pega da query (?ani=...)
+  // e de path param /api/argus-webhook/+55DDD...
+  const url = new URL(req.url);
+  const qPhone = url.searchParams.get("ani") || url.searchParams.get("phone") || url.searchParams.get("caller");
+  if (qPhone) payload.query_phone = qPhone;
+  
+  const parts = url.pathname.split("/").filter(Boolean);
+  const tail = decodeURIComponent(parts[parts.length - 1] || "");
+  if (/^\+?\d[\d()\-.\s]+$/.test(tail)) payload.path_phone = tail;
   // 👇 ADICIONE ESTE BLOCO
   if (typeof payload === "string") {
   try { payload = JSON.parse(payload); } catch {}
@@ -230,4 +250,5 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok (error logged)", { status: 200 });
   }
 }
+
 
