@@ -169,7 +169,10 @@ export default async function handler(req: Request): Promise<Response> {
     const text = await req.text();
     try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
   }
-
+  // 👇 ADICIONE ESTE BLOCO
+  if (typeof payload === "string") {
+  try { payload = JSON.parse(payload); } catch {}
+  }
   // Enriquecimentos
   const url = new URL(req.url);
   const qPhone = url.searchParams.get("ani") || url.searchParams.get("phone") || url.searchParams.get("caller");
@@ -227,3 +230,4 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok (error logged)", { status: 200 });
   }
 }
+
