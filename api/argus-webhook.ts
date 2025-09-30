@@ -5,14 +5,17 @@ export const config = { runtime: "edge" };
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ARGUS_WEBHOOK_SECRET = (process.env.ARGUS_WEBHOOK_SECRET || "").trim();
+
 const VAPI_API_KEY = process.env.VAPI_API_KEY!;
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || ""; // opcional
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID || "";       // obrigatório p/ /call
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID || ""; // origem (número Vapi)
+const VAPI_SIP_TRUNK_ID   = process.env.VAPI_SIP_TRUNK_ID   || "";   // origem alternativa (SIP)
+const DRY_RUN = process.env.DRY_RUN === "1";                         // não liga de verdade
 
 // ===== Utils =====
 const onlyDigits = (v?: string) => (v || "").replace(/\D/g, "");
 const looksLikeTpl = (s?: string) => typeof s === "string" && /\{\{\s*.+\s*\}\}/.test(s);
 
-/** Converte formatos BR em E.164 (+55DDDN...) – exige DDD. */
 function toE164BR(v?: string): string | null {
   if (!v) return null;
   const compact = v.replace(/[()\-\s]/g, "");
@@ -20,16 +23,13 @@ function toE164BR(v?: string): string | null {
 
   const d = onlyDigits(v);
   if (d.startsWith("0055") && (d.length === 14 || d.length === 15)) {
-    const rest = d.slice(4);
-    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+    const rest = d.slice(4); if (rest.length === 10 || rest.length === 11) return "+55" + rest;
   }
   if (d.startsWith("55") && (d.length === 12 || d.length === 13)) {
-    const rest = d.slice(2);
-    if (rest.length === 10 || rest.length === 11) return "+55" + rest;
+    const rest = d.slice(2); if (rest.length === 10 || rest.length === 11) return "+55" + rest;
   }
   if ((d.length === 11 || d.length === 12) && d.startsWith("0")) {
-    const s = d.replace(/^0+/, "");
-    if (s.length === 10 || s.length === 11) return "+55" + s;
+    const s = d.replace(/^0+/, ""); if (s.length === 10 || s.length === 11) return "+55" + s;
   }
   if (d.length === 10 || d.length === 11) return "+55" + d;
   return null;
@@ -73,7 +73,7 @@ function maskSecret(h: Headers) {
   return obj;
 }
 
-/** Procura telefones no texto cru: +55DDDN..., 55DDDN..., ou sequências de 10–13 dígitos. */
+/** Telefones no texto cru: +55DDDN..., 55DDDN..., ou sequências de 10–13 dígitos. */
 function findPhonesInRaw(raw: string): string[] {
   const out = new Set<string>();
   if (!raw) return [];
@@ -105,6 +105,7 @@ function extractPhoneBR(payload: any): { raw?: string; e164?: string } {
   return {};
 }
 
+// ===== Supabase =====
 async function upsertArgusEvent(opts: {
   externalId: string; eventType?: string; payload?: any; patch?: Record<string, unknown>;
 }) {
@@ -135,46 +136,54 @@ async function upsertArgusEvent(opts: {
   if (!r.ok) throw new Error(`DB insert ${r.status}: ${await r.text()}`);
 }
 
-/** Chama a Vapi (endpoint /calls) com to/from; assistantId opcional. */
+// ===== Vapi (POST /call) =====
 async function callVapiStart(payload: any) {
   const { e164: to } = extractPhoneBR(payload);
   if (!to) throw new Error("invalid_phone: payload não contém número BR válido (+55DDDN...).");
 
-  const from = toE164BR(pick<string>(payload?.caller, payload?.from, payload?.call?.ani));
+  const assistantId = payload?.assistantId || VAPI_ASSISTANT_ID;
+  if (!assistantId) throw new Error("vapi_config: assistantId é obrigatório");
+
+  const phoneNumberId = payload?.phoneNumberId || VAPI_PHONE_NUMBER_ID;
+  const sipTrunkId   = payload?.sipTrunkId   || VAPI_SIP_TRUNK_ID;
+  if (!phoneNumberId && !sipTrunkId) {
+    throw new Error("vapi_config: informe VAPI_PHONE_NUMBER_ID ou VAPI_SIP_TRUNK_ID");
+  }
 
   const body: Record<string, any> = {
-    to, from,
+    assistantId,
+    customer: { number: to },
     metadata: { source: "argus", argusId: pick<string>(payload?.id, payload?.call?.id) }
   };
-  const assistantId = payload?.assistantId || VAPI_ASSISTANT_ID;
-  if (assistantId) body.assistantId = assistantId;
+  if (phoneNumberId) body.phoneNumberId = phoneNumberId;
+  if (sipTrunkId)   body.sipTrunkId   = sipTrunkId;
 
-  const res = await fetch("https://api.vapi.ai/calls", {
+  const res = await fetch("https://api.vapi.ai/call", {
     method: "POST",
     headers: { Authorization: `Bearer ${VAPI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
   if (!res.ok) throw new Error(`vapi_${res.status}: ${await res.text()}`);
   return res.json(); // { id: "..." }
 }
 
 // ===== Handler =====
 export default async function handler(req: Request): Promise<Response> {
-  // Apenas POST
   if (req.method !== "POST") return new Response("Only POST", { status: 405 });
 
-  // --- Auth + segredo/telefone no mesmo header (se vier) ---
+  // Auth + "telefone junto no header" (opcional)
   const secHeader = req.headers.get("X-Argus-Secret") ?? req.headers.get("Authorization") ?? "";
   const { secret: headerSecret, phone: headerPhone } = parseSecretAndPhoneFromHeader(secHeader);
   if (ARGUS_WEBHOOK_SECRET && headerSecret !== ARGUS_WEBHOOK_SECRET) {
     return new Response("Unauthorized", { status: 401 });
   }
 
-  // Leia o corpo cru (para debug) SEM consumir o original
+  // Captura o corpo cru pra debug (sem consumir o original req.json())
   const cloned = req.clone();
   const rawText = await cloned.text().catch(() => "");
 
-  // --- Body (json ou texto) ---
+  // Body (json ou texto)
   const ct = req.headers.get("content-type") || "";
   let payload: any = {};
   if (ct.includes("application/json")) {
@@ -184,17 +193,17 @@ export default async function handler(req: Request): Promise<Response> {
     try { payload = JSON.parse(txt); } catch { payload = { raw: txt }; }
   }
 
-  // Duplo parse: se veio como string JSON, parse de novo
+  // Duplo parse (caso venha JSON como string)
   if (typeof payload === "string") {
-    try { payload = JSON.parse(payload); } catch { /* segue sem quebrar */ }
+    try { payload = JSON.parse(payload); } catch { /* segue */ }
   }
 
-  // Header dedicado com ANI OU telefone embutido em X-Argus-Secret
+  // Telefone por header dedicado (no futuro) ou embutido no X-Argus-Secret
   const xAni = req.headers.get("X-Argus-ANI");
   if (xAni) (payload ??= {}).header_phone = xAni;
   else if (headerPhone) (payload ??= {}).header_phone = headerPhone;
 
-  // Query & Path (para cobrir variações)
+  // Query & Path
   const reqUrl = new URL(req.url);
   const queryAni = reqUrl.searchParams.get("ani")
                  || reqUrl.searchParams.get("phone")
@@ -205,36 +214,45 @@ export default async function handler(req: Request): Promise<Response> {
   const pathTail = decodeURIComponent(pathParts[pathParts.length - 1] || "");
   if (/^\+?\d[\d()\-.\s]+$/.test(pathTail)) payload.path_phone = pathTail;
 
-  // DEBUG: salva cabeçalhos (mascarados), url e body cru
+  // Debug útil
   (payload.debug ??= {}).headers = maskSecret(req.headers);
   payload.debug.url = req.url;
   payload.debug.raw = rawText;
 
-  // Fallback: se ainda não tiver número em header/query/path, tenta achar no raw
+  // Fallback: tenta achar telefone no texto cru
   if (!payload.header_phone && !payload.query_phone && !payload.path_phone) {
     const found = findPhonesInRaw(rawText);
     if (found.length === 1) {
       payload.header_phone = found[0];
     } else if (found.length > 1) {
-      payload.header_phone = found[0]; // pega o primeiro
+      payload.header_phone = found[0];
       (payload.debug ??= {}).raw_candidates = found;
     }
   }
 
-  // externalId: usa payload.id/call.id; se vier placeholder ou vazio, gera estável
+  // externalId: usa id/call.id; se vier placeholder ou vazio, gera estável
   let externalId = pick<string>(payload?.id, payload?.callId, payload?.call?.id) || "";
   if (!externalId || looksLikeTpl(externalId)) {
     externalId = await stableIdFromPayload(payload);
   }
 
-  // grava "received"
+  // received
   try {
     await upsertArgusEvent({ externalId, eventType: payload?.type, payload });
   } catch {
     return new Response("db_error", { status: 202 });
   }
 
-  // chama Vapi (relay)
+  // Modo seco (opcional)
+  if (DRY_RUN) {
+    await upsertArgusEvent({
+      externalId,
+      patch: { status: "queued", processed_at: new Date().toISOString(), error: null },
+    });
+    return new Response("ok (dry-run)", { status: 200 });
+  }
+
+  // Chama Vapi
   try {
     const vapi = await callVapiStart(payload);
     await upsertArgusEvent({
@@ -257,7 +275,6 @@ export default async function handler(req: Request): Promise<Response> {
         processed_at: new Date().toISOString()
       },
     });
-    // 200 para não forçar retry agressivo do Argus
     return new Response("ok (error logged)", { status: 200 });
   }
 }
